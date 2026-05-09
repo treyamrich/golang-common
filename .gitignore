@@ -1,0 +1,21 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Coverage / profiling
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Vendor
+vendor/
