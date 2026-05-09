@@ -18,8 +18,15 @@ import (
 
 	contribhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/treyamrich/golang-common/log"
 	"github.com/treyamrich/golang-common/metrics"
 )
+
+// CorrelationIDHeader is the canonical header used to propagate cxid
+// across services. Server reads it (validating against log.IsValidCxid),
+// generates one if absent/malformed, and echoes it back on the response.
+// NewClient forwards it from context on outbound calls.
+const CorrelationIDHeader = "X-Correlation-Id"
 
 // DefaultExcludedPaths are stripped from instrumentation by default. These
 // are the common-convention endpoints that would otherwise pollute the API
@@ -78,6 +85,18 @@ func Server(h http.Handler, opts ...ServerOption) http.Handler {
 
 	excluded := pathSet(cfg.excludedPaths)
 	instrumented := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Cxid extraction/injection runs on EVERY request — including
+		// excluded paths — so a /healthz call that fans out to backend
+		// services still carries a usable correlation id. The metric
+		// emission below is what's path-gated.
+		cxid := r.Header.Get(CorrelationIDHeader)
+		if !log.IsValidCxid(cxid) {
+			cxid = log.NewCxid()
+		}
+		ctx := log.WithCxid(r.Context(), cxid)
+		r = r.WithContext(ctx)
+		w.Header().Set(CorrelationIDHeader, cxid)
+
 		if _, skip := excluded[r.URL.Path]; skip {
 			h.ServeHTTP(w, r)
 			return

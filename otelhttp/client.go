@@ -6,6 +6,7 @@ import (
 
 	contribhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/treyamrich/golang-common/log"
 	"github.com/treyamrich/golang-common/metrics"
 )
 
@@ -68,6 +69,17 @@ type metricsRoundTripper struct {
 }
 
 func (m *metricsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Forward cxid from context onto the outbound request — but never
+	// override a header the caller already set, in case it's intentional
+	// (e.g., replaying or stitching trace).
+	if req.Header.Get(CorrelationIDHeader) == "" {
+		if cxid := log.FromContext(req.Context()); cxid != "" {
+			// Clone before mutating to avoid surprising the caller.
+			req = req.Clone(req.Context())
+			req.Header.Set(CorrelationIDHeader, cxid)
+		}
+	}
+
 	start := time.Now()
 	resp, err := m.next.RoundTrip(req)
 	dur := time.Since(start)

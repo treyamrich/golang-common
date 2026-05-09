@@ -9,10 +9,11 @@ later release.
 ## Install
 
 ```sh
-go get github.com/treyamrich/golang-common/otelinit@v0.2.0
-go get github.com/treyamrich/golang-common/otelhttp@v0.2.0
-go get github.com/treyamrich/golang-common/metrics@v0.2.0
-go get github.com/treyamrich/golang-common/health@v0.2.0
+go get github.com/treyamrich/golang-common/otelinit@v0.3.0
+go get github.com/treyamrich/golang-common/otelhttp@v0.3.0
+go get github.com/treyamrich/golang-common/metrics@v0.3.0
+go get github.com/treyamrich/golang-common/health@v0.3.0
+go get github.com/treyamrich/golang-common/log@v0.3.0
 ```
 
 ## Packages
@@ -124,6 +125,56 @@ Names starting with `api_` are reserved for the standard tier — adhoc
 emitters return `metrics.ErrReservedName` if used. This keeps the
 `api_*` namespace clean for cross-service dashboards.
 
+### `log` — structured logging + correlation IDs
+
+```go
+if err := log.Init(log.Config{
+    Level:       os.Getenv("LOG_LEVEL"),       // debug|info|warn|error, default info
+    StaticAttrs: map[string]string{"service": "app-broker", "env": "prod"},
+}); err != nil && !errors.Is(err, log.ErrAlreadyInitialized) {
+    panic(err)
+}
+
+// In a request handler:
+func handle(w http.ResponseWriter, r *http.Request) {
+    logger := log.New(r.Context())
+    logger.Info("processing request", "user_id", userID)
+    // {"time":"...","level":"INFO","msg":"processing request",
+    //  "cxid":"<32 hex>","user_id":"...","service":"app-broker","env":"prod"}
+}
+```
+
+`Init` configures `slog.Default` to write JSON to stderr with RFC3339Nano
+timestamps. It is idempotent — second and later calls return
+`log.ErrAlreadyInitialized` (callers in tests can ignore it). Bad
+`LOG_LEVEL` values are coerced to `info` with a one-time warning rather
+than panicking.
+
+`log.New(ctx)` returns a `*slog.Logger` pre-bound with the cxid (if any)
+from `ctx`. All request-scope logging should go through it instead of
+`slog.Default()` so cxid auto-propagates to every line.
+
+### Correlation IDs
+
+A correlation ID (`cxid`) is a 32-hex-char UUIDv4 (no hyphens) that ties a
+single request's logs together across services. The flow is fully
+automatic when both ends use this library:
+
+1. **Inbound:** `otelhttp.Server` reads the `X-Correlation-Id` header. If
+   it matches `^[a-f0-9]{32}$` it's reused; otherwise a fresh one is
+   generated. The cxid is injected into `r.Context()` via `log.WithCxid`
+   and echoed back on the response as `X-Correlation-Id` (so the caller
+   can grep their own logs).
+2. **In-process:** any handler that calls `log.New(r.Context())` emits
+   logs with the `cxid` attribute attached automatically.
+3. **Outbound:** `otelhttp.NewClient` reads `log.FromContext(req.Context())`
+   on every outbound call and sets `X-Correlation-Id` on the wire (only
+   if the caller didn't already set the header). The next service's
+   middleware extracts the same cxid → its logs share it. End-to-end
+   correlation is one-import deep.
+
+The cxid is intentionally NOT a metric label (see "What's NOT").
+
 ### `health` — /healthz and /readyz
 
 ```go
@@ -168,8 +219,16 @@ counted in the API metrics.
   later release without changing the public surface.
 - **No retry / circuit-breaker logic** in `otelhttp.NewClient`. That's a
   service concern; this library only enforces a default timeout.
-- **No log shipper.** Log handling is left to the consuming service —
-  stdout + a cluster-level collector is the recommended pattern.
+- **No log shipper.** The `log` package emits structured JSON to stderr;
+  shipping to a cluster-level collector (Loki, ELK, etc.) is the
+  consuming service's concern.
+- **`cxid` is intentionally NOT a metric label.** A per-request label
+  would explode time-series cardinality. Cxid belongs on logs and traces
+  — never on metric series.
+- **No trace ID propagation in the `log` package.** When span emission
+  lands in a later release the request-scope logger will gain a
+  `trace_id` attribute alongside `cxid`. Until then, the cxid is the
+  primary correlation primitive.
 
 ## Versioning
 
@@ -178,6 +237,14 @@ under this module shares the module-wide tag.
 
 **Pre-1.0.** Breaking changes possible at minor bumps. v1.0.0 is tagged
 once the API is stable across at least three consumers.
+
+## Upgrading from v0.2.0
+
+v0.3.0 is fully backward-compatible. Cxid features are opt-in by
+importing the new `log/` package; existing v0.2.0 callers see no
+behavioural change beyond the addition of an `X-Correlation-Id` header
+on `otelhttp.Server` responses (and auto-forwarding from
+`otelhttp.NewClient` when the caller's context carries one).
 
 ## Upgrading from v0.1.0
 
