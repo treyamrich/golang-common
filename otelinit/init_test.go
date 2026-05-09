@@ -25,10 +25,18 @@ func TestInit_RequiresServiceName(t *testing.T) {
 	}
 }
 
+func TestInit_RequiresEnvironment(t *testing.T) {
+	resetForTest()
+	_, err := Init(context.Background(), Config{ServiceName: "svc", OTLPEndpoint: "localhost:4317", Insecure: true})
+	if err == nil {
+		t.Fatal("expected error for missing Environment")
+	}
+}
+
 func TestInit_RequiresEndpoint(t *testing.T) {
 	resetForTest()
 	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	_, err := Init(context.Background(), Config{ServiceName: "svc"})
+	_, err := Init(context.Background(), Config{ServiceName: "svc", Environment: "test"})
 	if err == nil {
 		t.Fatal("expected error for missing endpoint")
 	}
@@ -37,7 +45,7 @@ func TestInit_RequiresEndpoint(t *testing.T) {
 func TestInit_FallsBackToEnvEndpoint(t *testing.T) {
 	resetForTest()
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
-	shutdown, err := Init(context.Background(), Config{ServiceName: "svc", Insecure: true})
+	shutdown, err := Init(context.Background(), Config{ServiceName: "svc", Environment: "test", Insecure: true})
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -48,6 +56,7 @@ func TestInit_Idempotent(t *testing.T) {
 	resetForTest()
 	shutdown, err := Init(context.Background(), Config{
 		ServiceName:  "svc",
+		Environment:  "test",
 		OTLPEndpoint: "localhost:4317",
 		Insecure:     true,
 	})
@@ -58,6 +67,7 @@ func TestInit_Idempotent(t *testing.T) {
 
 	_, err2 := Init(context.Background(), Config{
 		ServiceName:  "svc",
+		Environment:  "test",
 		OTLPEndpoint: "localhost:4317",
 		Insecure:     true,
 	})

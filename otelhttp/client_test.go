@@ -62,13 +62,13 @@ func TestNewClient_RecordsMetrics(t *testing.T) {
 	found := false
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name == "http.client.request.duration" {
+			if m.Name == "api_histogram" {
 				found = true
 			}
 		}
 	}
 	if !found {
-		t.Errorf("expected http.client.request.duration to be recorded")
+		t.Errorf("expected api_histogram to be recorded")
 	}
 }
 

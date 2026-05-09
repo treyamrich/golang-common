@@ -10,16 +10,22 @@ import (
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/treyamrich/golang-common/metrics"
 )
 
 // installManualReader installs a fresh MeterProvider with a ManualReader on
-// the OTEL global. Returns the reader and a cleanup func.
+// the OTEL global and configures the metrics package. Returns the reader
+// and a cleanup func.
 func installManualReader(t *testing.T) (*sdkmetric.ManualReader, func()) {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
+	if err := metrics.Configure(metrics.Config{ServiceName: "test", Environment: "test"}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
 	return reader, func() {
 		_ = mp.Shutdown(context.Background())
 		otel.SetMeterProvider(prev)
@@ -54,8 +60,7 @@ func TestServer_RecordsRequestMetrics(t *testing.T) {
 	srv := httptest.NewServer(wrapped)
 	defer srv.Close()
 
-	for _, status := range []int{200, 200, 200} {
-		_ = status
+	for i := 0; i < 3; i++ {
 		resp, err := http.Get(srv.URL + "/foo")
 		if err != nil {
 			t.Fatalf("get: %v", err)
@@ -65,8 +70,8 @@ func TestServer_RecordsRequestMetrics(t *testing.T) {
 	}
 
 	names := collectMetricNames(t, reader)
-	if !names["http.server.request.duration"] {
-		t.Errorf("expected http.server.request.duration, got %v", names)
+	if !names["api_histogram"] || !names["api_counter"] {
+		t.Errorf("expected api_histogram + api_counter, got %v", names)
 	}
 }
 
@@ -100,11 +105,10 @@ func TestServer_DifferentStatusCodes(t *testing.T) {
 		t.Fatalf("collect: %v", err)
 	}
 
-	// Sum the histogram data points across all status codes — we expect 3.
 	var dataPoints int
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "http.server.request.duration" {
+			if m.Name != "api_histogram" {
 				continue
 			}
 			h, ok := m.Data.(metricdata.Histogram[float64])
@@ -140,7 +144,7 @@ func TestServer_ExcludesDefaultPaths(t *testing.T) {
 	}
 
 	names := collectMetricNames(t, reader)
-	if names["http.server.request.duration"] {
+	if names["api_histogram"] || names["api_counter"] {
 		t.Errorf("expected default-excluded paths to NOT emit metrics, got %v", names)
 	}
 }
@@ -152,8 +156,6 @@ func TestServer_OverrideExcludedPaths(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	// Pass a custom excludes list — /api/foo gets excluded, /healthz now
-	// instrumented.
 	srv := httptest.NewServer(Server(handler, WithExcludedPaths("/api/foo")))
 	defer srv.Close()
 
@@ -164,7 +166,7 @@ func TestServer_OverrideExcludedPaths(t *testing.T) {
 	resp.Body.Close()
 
 	names := collectMetricNames(t, reader)
-	if !names["http.server.request.duration"] {
+	if !names["api_histogram"] {
 		t.Errorf("/healthz should be instrumented when not in excludes, got %v", names)
 	}
 }
@@ -184,5 +186,23 @@ func TestExcludeFilter_EmptyAllowsAll(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	if !f(req) {
 		t.Fatal("empty excludes should allow everything")
+	}
+}
+
+func TestStatusString(t *testing.T) {
+	if statusString(404) != "404" {
+		t.Fatal("statusString")
+	}
+}
+
+func TestClassify(t *testing.T) {
+	if classify(200) != metrics.StatusSuccess {
+		t.Fatal("200 should be success")
+	}
+	if classify(404) != metrics.StatusError {
+		t.Fatal("404 should be error")
+	}
+	if classify(500) != metrics.StatusFailure {
+		t.Fatal("500 should be failure")
 	}
 }

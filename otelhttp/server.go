@@ -1,24 +1,29 @@
 // Package otelhttp wraps the upstream
 // go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp package with
-// homelab-opinionated defaults: pre-configured exclusion of liveness/readiness
-// and metrics scrape endpoints, and a service-name option that flows into
-// the upstream WithServerName setting.
+// opinionated defaults: pre-configured exclusion of liveness/readiness and
+// metrics scrape endpoints, a service-name option that flows into the
+// upstream WithServerName setting, and emission of the standard
+// api_counter / api_histogram metrics from the metrics package (so all
+// services share one dashboard surface).
 //
-// Spans are intentionally NOT emitted in v0.1.0 — we ship metrics only and
-// will add a span hook later without changing the public surface. Metric
-// instrumentation comes directly from the upstream package, so we do NOT
-// reinvent instruments.
+// Spans are intentionally NOT emitted in v0.x — we ship metrics only and
+// will add a span hook in a later release without changing the public
+// surface.
 package otelhttp
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 
 	contribhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/treyamrich/golang-common/metrics"
 )
 
 // DefaultExcludedPaths are stripped from instrumentation by default. These
-// are the homelab convention endpoints that would otherwise pollute the
-// http.server.* histogram with high-cardinality, low-signal samples.
+// are the common-convention endpoints that would otherwise pollute the API
+// metrics with high-cardinality, low-signal samples.
 var DefaultExcludedPaths = []string{"/healthz", "/readyz", "/metrics"}
 
 type serverConfig struct {
@@ -32,7 +37,7 @@ type serverConfig struct {
 type ServerOption func(*serverConfig)
 
 // WithServiceName sets the upstream WithServerName attribute, which appears
-// as server.address on emitted metrics.
+// as server.address on emitted upstream metrics (kept for trace context).
 func WithServiceName(name string) ServerOption {
 	return func(c *serverConfig) { c.serviceName = name }
 }
@@ -49,23 +54,19 @@ func WithOperationName(op string) ServerOption {
 	return func(c *serverConfig) { c.operationName = op }
 }
 
-// WithUpstreamOptions appends raw upstream contribhttp.Options. Use as an
-// escape hatch when you need an upstream feature we haven't surfaced.
+// WithUpstreamOptions appends raw upstream contribhttp.Options.
 func WithUpstreamOptions(opts ...contribhttp.Option) ServerOption {
 	return func(c *serverConfig) { c.upstreamOpts = append(c.upstreamOpts, opts...) }
 }
 
-// Server wraps an http.Handler with OTEL HTTP server instrumentation per
-// the OTEL semantic conventions. Emitted metrics:
+// Server wraps an http.Handler with HTTP server instrumentation. For every
+// non-excluded request it emits the standard tier metrics from the
+// metrics package:
 //
-//	http.server.request.duration  (histogram, seconds)
-//	http.server.active_requests   (UpDownCounter)
+//	api_counter   labels: status, route, method, code + standard set
+//	api_histogram labels: status, route, method, code + standard set (unit=seconds)
 //
-// Labels follow conventions: http.request.method, http.response.status_code,
-// http.route, server.address.
-//
-// Default excluded paths: /healthz, /readyz, /metrics. Override via
-// WithExcludedPaths.
+// Default excluded paths: /healthz, /readyz, /metrics.
 func Server(h http.Handler, opts ...ServerOption) http.Handler {
 	cfg := &serverConfig{
 		excludedPaths: DefaultExcludedPaths,
@@ -75,6 +76,26 @@ func Server(h http.Handler, opts ...ServerOption) http.Handler {
 		o(cfg)
 	}
 
+	excluded := pathSet(cfg.excludedPaths)
+	instrumented := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, skip := excluded[r.URL.Path]; skip {
+			h.ServeHTTP(w, r)
+			return
+		}
+		sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		h.ServeHTTP(sw, r)
+		dur := time.Since(start)
+		status := classify(sw.status)
+		opts := []metrics.APIOption{
+			metrics.WithRoute(r.URL.Path),
+			metrics.WithMethod(r.Method),
+			metrics.WithCode(sw.status),
+		}
+		metrics.IncAPI(status, opts...)
+		metrics.RecordAPILatency(dur, status, opts...)
+	})
+
 	upstream := []contribhttp.Option{
 		contribhttp.WithFilter(excludeFilter(cfg.excludedPaths)),
 	}
@@ -82,18 +103,58 @@ func Server(h http.Handler, opts ...ServerOption) http.Handler {
 		upstream = append(upstream, contribhttp.WithServerName(cfg.serviceName))
 	}
 	upstream = append(upstream, cfg.upstreamOpts...)
+	return contribhttp.NewHandler(instrumented, cfg.operationName, upstream...)
+}
 
-	return contribhttp.NewHandler(h, cfg.operationName, upstream...)
+func classify(code int) metrics.Status {
+	switch {
+	case code >= 500:
+		return metrics.StatusFailure
+	case code >= 400:
+		return metrics.StatusError
+	default:
+		return metrics.StatusSuccess
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status = code
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.wrote = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// statusString renders an HTTP code as its decimal string. Exposed for
+// internal helpers (and to keep strconv usage in one place).
+func statusString(code int) string { return strconv.Itoa(code) }
+
+func pathSet(paths []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		set[p] = struct{}{}
+	}
+	return set
 }
 
 func excludeFilter(paths []string) contribhttp.Filter {
 	if len(paths) == 0 {
 		return func(*http.Request) bool { return true }
 	}
-	set := make(map[string]struct{}, len(paths))
-	for _, p := range paths {
-		set[p] = struct{}{}
-	}
+	set := pathSet(paths)
 	return func(r *http.Request) bool {
 		_, excluded := set[r.URL.Path]
 		return !excluded

@@ -1,10 +1,12 @@
 // Package otelinit provides idiomatic OpenTelemetry SDK initialization for
-// homelab Go services.
+// Go services consuming this library.
 //
-// v0.1.0 wires the global MeterProvider and Propagators with an OTLP gRPC
-// metric exporter. Tracing is intentionally deferred — the same Init can be
-// extended to enable a TracerProvider later without changing the public
-// surface.
+// v0.x wires the global MeterProvider and Propagators with an OTLP gRPC
+// metric exporter, AND configures the metrics package's standard label
+// set so subsequent calls into metrics.IncAPI / IncCounter etc. emit with
+// the runtime context attached. Tracing is intentionally deferred — the
+// same Init can be extended to enable a TracerProvider later without
+// changing the public surface.
 package otelinit
 
 import (
@@ -22,6 +24,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+
+	"github.com/treyamrich/golang-common/metrics"
 )
 
 // ErrAlreadyInitialized is returned when Init is called more than once in a
@@ -30,28 +34,40 @@ import (
 var ErrAlreadyInitialized = errors.New("otelinit: already initialized")
 
 // Config controls Init behavior.
-//
-// Future-compatibility: TraceSampleRate, MetricExportInterval, and
-// ResourceAttrs map[string]string can be added without breaking the API.
 type Config struct {
 	// ServiceName is required, e.g. "app-broker".
 	ServiceName string
 
-	// ServiceVersion is optional; "" defaults to "dev".
+	// ServiceVersion is optional; "" defaults to "dev". Used for resource
+	// attributes and (separately) /healthz — NOT as a metric label.
 	ServiceVersion string
 
-	// OTLPEndpoint is the OTLP gRPC endpoint, e.g.
-	// "otel-collector.monitoring.svc:4317". If empty, falls back to the
-	// OTEL_EXPORTER_OTLP_ENDPOINT environment variable. Required (one of
-	// the two).
+	// Environment is required. Examples: "prod", "staging", "dev".
+	// Becomes the env standard metric label.
+	Environment string
+
+	// Cluster is optional. Example: "prod-us-east".
+	// Falls back to env CLUSTER_NAME.
+	Cluster string
+
+	// Region is optional. Example: "us-east-1".
+	// Falls back to env REGION.
+	Region string
+
+	// StaticLabels is optional and attaches extra labels to every metric.
+	// Values here override any auto-detected entry with the same key.
+	StaticLabels map[string]string
+
+	// OTLPEndpoint is the OTLP gRPC endpoint. Falls back to
+	// OTEL_EXPORTER_OTLP_ENDPOINT. Required (one of the two).
 	OTLPEndpoint string
 
-	// Insecure skips TLS to the collector — typical for in-cluster.
+	// Insecure skips TLS to the collector — typical when the collector is
+	// reachable via in-cluster service DNS.
 	Insecure bool
 
 	// PropagatorNames selects W3C propagators to install on the global
 	// TextMapPropagator. Default: ["tracecontext", "baggage"].
-	// Recognized: "tracecontext", "baggage".
 	PropagatorNames []string
 }
 
@@ -60,9 +76,9 @@ var (
 	initDone bool
 )
 
-// Init wires the global MeterProvider and Propagators per cfg. It is
-// idempotent within a process — subsequent calls return
-// ErrAlreadyInitialized.
+// Init wires the global MeterProvider, Propagators, and metrics standard
+// label set per cfg. It is idempotent within a process — subsequent calls
+// return ErrAlreadyInitialized.
 //
 // The returned shutdown should be deferred in main. It flushes pending
 // metrics with a 5s timeout (overridable via the ctx passed to shutdown).
@@ -76,6 +92,9 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 
 	if cfg.ServiceName == "" {
 		return nil, errors.New("otelinit: ServiceName is required")
+	}
+	if cfg.Environment == "" {
+		return nil, errors.New("otelinit: Environment is required")
 	}
 	endpoint := cfg.OTLPEndpoint
 	if endpoint == "" {
@@ -125,12 +144,21 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 
 	otel.SetTextMapPropagator(buildPropagator(cfg.PropagatorNames))
 
+	if err := metrics.Configure(metrics.Config{
+		ServiceName:  cfg.ServiceName,
+		Environment:  cfg.Environment,
+		Cluster:      cfg.Cluster,
+		Region:       cfg.Region,
+		StaticLabels: cfg.StaticLabels,
+	}); err != nil {
+		return nil, fmt.Errorf("otelinit: metrics configure: %w", err)
+	}
+
 	initDone = true
 
 	shutdown = func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		// Reset state so tests/process-replays can re-Init.
 		initMu.Lock()
 		initDone = false
 		initMu.Unlock()
