@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.0 — 2026-11-24
+
+### Added
+- `appbroker/` package: the app-broker client SDK, moved here from
+  app-broker's `pkg/client` so any service can import it (app-broker's
+  repo is private). Typed methods for every broker endpoint, `FromEnv`
+  (projected service-account token or static token), `ForEachInstall`,
+  `TokenCache`, `WithIDToken`, and sentinel errors.
+
+### Changed
+- (None for existing packages.) Compared to app-broker's `pkg/client`,
+  the deprecated `ClientOptions.Mode` / `ModeA` / `ModeB` are gone: a
+  sign-in is forwarded whenever the context carries one.
+
 ## v0.3.0 — 2026-05-09
 
 ### Added
