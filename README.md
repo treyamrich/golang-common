@@ -3,8 +3,8 @@
 Shared Go libraries for services consuming this module. Ships an
 OpenTelemetry metrics baseline (HTTP server middleware, HTTP client
 wrapper), an OTEL init helper, a small standard-and-adhoc metrics API,
-and uniform health endpoints. Tracing is intentionally deferred to a
-later release.
+uniform health endpoints, and the app-broker client SDK. Tracing is
+intentionally deferred to a later release.
 
 ## Install
 
@@ -14,6 +14,7 @@ go get github.com/treyamrich/golang-common/otelhttp@v0.3.0
 go get github.com/treyamrich/golang-common/metrics@v0.3.0
 go get github.com/treyamrich/golang-common/health@v0.3.0
 go get github.com/treyamrich/golang-common/log@v0.3.0
+go get github.com/treyamrich/golang-common/appbroker@v0.4.0
 ```
 
 ## Packages
@@ -174,6 +175,47 @@ automatic when both ends use this library:
    correlation is one-import deep.
 
 The cxid is intentionally NOT a metric label (see "What's NOT").
+
+### `appbroker` — app-broker client SDK
+
+Third-party API auth for homelab services goes through app-broker: it
+holds provider credentials, runs every exchange and refresh, and hands
+services short-lived access tokens. This package is the typed client.
+Standard library only.
+
+A service declares what it uses in its own chart (app-template's
+`appBroker:` block renders a `BrokerConsumer`): `appCapabilities` for
+app-level apps (client credentials, granted at deploy) and `userApps`
+for per-user apps (usable only for users who installed them). The same
+block mounts a projected service-account token, which `FromEnv` reads:
+
+```go
+c, err := appbroker.FromEnv() // APP_BROKER_URL, APP_BROKER_TOKEN_FILE (or APP_BROKER_TOKEN off-cluster)
+tokens := appbroker.NewTokenCache(c)
+
+// App-level capability.
+tok, err := tokens.ClientToken(ctx, "spotify-catalog", "")
+
+// Per-user: act for exactly the users who installed the app.
+err = c.ForEachInstall(ctx, "spotify-playlist-bot", func(ctx context.Context, in appbroker.Install) error {
+    tok, err := tokens.UserToken(ctx, in)
+    if errors.Is(err, appbroker.ErrConsentRevoked) || errors.Is(err, appbroker.ErrNotFound) {
+        return nil // user must reinstall from the dashboard
+    }
+    if err != nil {
+        return err
+    }
+    return run(ctx, in, tok.AccessToken)
+})
+```
+
+A UI acting for the signed-in user forwards their Authentik ID token
+with `appbroker.WithIDToken(ctx, idToken)`. Install, uninstall and
+listing a user's connections require it.
+
+Errors are typed sentinels (`ErrForbidden`, `ErrNotFound`,
+`ErrConsentRevoked`, `ErrUpstreamUnavailable`, …) usable with
+`errors.Is`.
 
 ### `health` — /healthz and /readyz
 
