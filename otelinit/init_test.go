@@ -2,7 +2,12 @@ package otelinit
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/treyamrich/golang-common/metrics"
 	"testing"
 
 	"go.opentelemetry.io/otel"
@@ -33,12 +38,39 @@ func TestInit_RequiresEnvironment(t *testing.T) {
 	}
 }
 
-func TestInit_RequiresEndpoint(t *testing.T) {
+func TestInit_OTLPRequiresEndpoint(t *testing.T) {
 	resetForTest()
 	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	_, err := Init(context.Background(), Config{ServiceName: "svc", Environment: "test"})
+	_, err := Init(context.Background(), Config{ServiceName: "svc", Environment: "test", Exporter: "otlp"})
 	if err == nil {
 		t.Fatal("expected error for missing endpoint")
+	}
+}
+
+func TestInit_PrometheusDefaultServesMetrics(t *testing.T) {
+	resetForTest()
+	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	shutdown, err := Init(context.Background(), Config{ServiceName: "svc", Environment: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	metrics.RecordAPI("getTask", 200, metrics.StatusSuccess, 3*time.Millisecond)
+	metrics.RecordDependency("postgres", "GetTask", metrics.StatusFailure, time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`api_histogram_count{`, `api="getTask"`, `http_status="200"`, `service="svc"`,
+		`dependency_histogram_bucket{`, `dependency="postgres"`, `status="failure"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %s in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "otel_scope") || strings.Contains(body, "_seconds") {
+		t.Errorf("unexpected scope/unit decoration:\n%s", body)
 	}
 }
 

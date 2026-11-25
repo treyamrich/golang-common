@@ -8,6 +8,7 @@ import (
 
 	"github.com/treyamrich/golang-common/log"
 	"github.com/treyamrich/golang-common/metrics"
+	"github.com/treyamrich/golang-common/observe"
 )
 
 // DefaultClientTimeout is applied to clients constructed by NewClient when
@@ -15,7 +16,11 @@ import (
 // hang a process indefinitely — this default is intentionally conservative.
 const DefaultClientTimeout = 10 * time.Second
 
+// CorrelationIDHeader carries the cxid between services.
+const CorrelationIDHeader = log.CorrelationIDHeader
+
 type clientConfig struct {
+	dependency    string
 	timeout       time.Duration
 	baseTransport http.RoundTripper
 	upstreamOpts  []contribhttp.Option
@@ -23,6 +28,12 @@ type clientConfig struct {
 
 // ClientOption configures NewClient.
 type ClientOption func(*clientConfig)
+
+// WithDependency names the dependency for the dependency_histogram
+// label ("spotify", "app-broker"). Default: the request URL's host.
+func WithDependency(name string) ClientOption {
+	return func(c *clientConfig) { c.dependency = name }
+}
 
 // WithTimeout overrides DefaultClientTimeout.
 func WithTimeout(d time.Duration) ClientOption {
@@ -40,14 +51,13 @@ func WithClientUpstreamOptions(opts ...contribhttp.Option) ClientOption {
 	return func(c *clientConfig) { c.upstreamOpts = append(c.upstreamOpts, opts...) }
 }
 
-// NewClient returns an *http.Client whose Transport is wrapped with the
-// upstream OTEL HTTP transport AND emits the standard tier metrics for
-// every completed call:
+// NewClient returns an *http.Client for calling a dependency. Every call
+// forwards the context's cxid as X-Correlation-Id and records one
+// dependency_histogram sample{dependency, operation=<HTTP method>,
+// status}. A call cancelled by our own context is "canceled", not a
+// failure.
 //
-//	api_counter   labels: status, route (URL path), method, code + standard set
-//	api_histogram labels: status, route (URL path), method, code + standard set (seconds)
-//
-// IMPORTANT: spans are not emitted in v0.x — metrics only.
+// Spans are not emitted in v0.x — metrics only.
 func NewClient(opts ...ClientOption) *http.Client {
 	cfg := &clientConfig{timeout: DefaultClientTimeout}
 	for _, o := range opts {
@@ -60,12 +70,13 @@ func NewClient(opts ...ClientOption) *http.Client {
 	wrapped := contribhttp.NewTransport(base, cfg.upstreamOpts...)
 	return &http.Client{
 		Timeout:   cfg.timeout,
-		Transport: &metricsRoundTripper{next: wrapped},
+		Transport: &metricsRoundTripper{next: wrapped, dependency: cfg.dependency},
 	}
 }
 
 type metricsRoundTripper struct {
-	next http.RoundTripper
+	next       http.RoundTripper
+	dependency string
 }
 
 func (m *metricsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -82,24 +93,30 @@ func (m *metricsRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 
 	start := time.Now()
 	resp, err := m.next.RoundTrip(req)
-	dur := time.Since(start)
-
-	route := ""
-	if req.URL != nil {
-		route = req.URL.Path
-	}
-	opts := []metrics.APIOption{
-		metrics.WithRoute(route),
-		metrics.WithMethod(req.Method),
+	dep := m.dependency
+	if dep == "" && req.URL != nil {
+		dep = req.URL.Hostname()
 	}
 	var status metrics.Status
 	if err != nil {
-		status = metrics.StatusFailure
+		status = observe.DefaultStatus(req.Context(), err)
 	} else {
-		opts = append(opts, metrics.WithCode(resp.StatusCode))
 		status = classify(resp.StatusCode)
 	}
-	metrics.IncAPI(status, opts...)
-	metrics.RecordAPILatency(dur, status, opts...)
+	metrics.RecordDependency(dep, req.Method, status, time.Since(start))
 	return resp, err
+}
+
+// classify maps a dependency's response code to our view of the call:
+// its 5xx and 429 (it couldn't serve us) are failures, other 4xx are
+// errors (usually our request was wrong), the rest success.
+func classify(code int) metrics.Status {
+	switch {
+	case code >= 500 || code == http.StatusTooManyRequests:
+		return metrics.StatusFailure
+	case code >= 400:
+		return metrics.StatusError
+	default:
+		return metrics.StatusSuccess
+	}
 }

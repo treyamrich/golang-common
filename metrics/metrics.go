@@ -1,12 +1,16 @@
 // Package metrics provides a small, opinionated metrics API on top of the
 // OTEL global MeterProvider. It exposes two tiers:
 //
-//  1. Standard API metrics — preset names (api_counter, api_histogram) and
-//     preset label keys. Use these for HTTP/RPC API timing across services
-//     so dashboards stay uniform.
+//  1. Standard metrics — three histograms with preset label keys, so
+//     dashboards stay uniform across services:
+//     api_histogram{api, http_status, status}            inbound requests
+//     dependency_histogram{dependency, operation, status} outbound calls
+//     job_histogram{job, status}                          worker runs
+//     Each histogram's _count is the call counter. Services normally
+//     don't call these directly: the api package, observe.Call and
+//     app's job loops do.
 //  2. Adhoc metrics — caller picks the name and label keys. Use sparingly.
-//     Names starting with "api_" are reserved for the standard tier and
-//     are rejected.
+//     The api_, dependency_ and job_ prefixes are reserved.
 //
 // Every metric (standard and adhoc) auto-attaches a "standard label set"
 // describing the runtime context (service, env, pod, namespace, host, ip,
@@ -46,12 +50,16 @@ const (
 	StatusError Status = "error"
 	// StatusFailure — unexpected failure (5xx, panic, dependency down).
 	StatusFailure Status = "failure"
+	// StatusCanceled — the caller went away (client disconnect, our own
+	// context cancelled during shutdown). Not an error on our side, so
+	// it is kept out of error and failure rates.
+	StatusCanceled Status = "canceled"
 )
 
-// Valid reports whether s is one of the three defined Status constants.
+// Valid reports whether s is one of the defined Status constants.
 func (s Status) Valid() bool {
 	switch s {
-	case StatusSuccess, StatusError, StatusFailure:
+	case StatusSuccess, StatusError, StatusFailure, StatusCanceled:
 		return true
 	}
 	return false
@@ -67,11 +75,7 @@ type Config struct {
 	StaticLabels map[string]string // optional — attached to every metric, override auto-detected values
 }
 
-const (
-	standardCounterName   = "api_counter"
-	standardHistogramName = "api_histogram"
-	meterScope            = "github.com/treyamrich/golang-common/metrics"
-)
+const meterScope = "github.com/treyamrich/golang-common/metrics"
 
 var (
 	cfgMu          sync.RWMutex
@@ -79,8 +83,9 @@ var (
 	standardLabels []attribute.KeyValue
 
 	instMu        sync.Mutex
-	apiCounter    metric.Int64Counter
 	apiHistogram  metric.Float64Histogram
+	depHistogram  metric.Float64Histogram
+	jobHistogram  metric.Float64Histogram
 	adhocCounters = map[string]metric.Int64Counter{}
 	adhocHistos   = map[string]metric.Float64Histogram{}
 )
@@ -88,9 +93,9 @@ var (
 // ErrNotConfigured is returned by adhoc emitters when Configure has not run.
 var ErrNotConfigured = errors.New("metrics: Configure has not been called")
 
-// ErrReservedName is returned when an adhoc metric name uses the "api_"
-// prefix reserved for the standard tier.
-var ErrReservedName = errors.New("metrics: name prefix \"api_\" is reserved for standard metrics")
+// ErrReservedName is returned when an adhoc metric name uses a prefix
+// reserved for the standard tier ("api_", "dependency_", "job_").
+var ErrReservedName = errors.New("metrics: name prefixes api_, dependency_ and job_ are reserved for standard metrics")
 
 // Configure sets the standard label set from cfg + auto-detected
 // environment values. It is idempotent — subsequent calls overwrite the
@@ -114,8 +119,9 @@ func Configure(cfg Config) error {
 	// Reset cached instruments so the next emit binds to whatever
 	// MeterProvider is currently installed on the OTEL global.
 	instMu.Lock()
-	apiCounter = nil
 	apiHistogram = nil
+	depHistogram = nil
+	jobHistogram = nil
 	adhocCounters = map[string]metric.Int64Counter{}
 	adhocHistos = map[string]metric.Float64Histogram{}
 	instMu.Unlock()
@@ -211,100 +217,92 @@ func firstNonLoopbackIP() string {
 	return ""
 }
 
-// apiCtx accumulates option-supplied labels for the standard tier.
-type apiCtx struct {
-	route   string
-	method  string
-	code    int
-	hasCode bool
-}
+// The three standard histograms. Each one's _count series is the call
+// counter, so no separate counters are emitted.
+const (
+	apiHistogramName        = "api_histogram"
+	dependencyHistogramName = "dependency_histogram"
+	jobHistogramName        = "job_histogram"
+)
 
-// APIOption configures a standard-tier emit.
-type APIOption func(*apiCtx)
-
-// WithRoute attaches a "route" label (server route or client target path).
-func WithRoute(route string) APIOption {
-	return func(c *apiCtx) { c.route = route }
-}
-
-// WithMethod attaches a "method" label (HTTP verb, RPC method).
-func WithMethod(method string) APIOption {
-	return func(c *apiCtx) { c.method = method }
-}
-
-// WithCode attaches a "code" label (HTTP status code, gRPC code).
-func WithCode(code int) APIOption {
-	return func(c *apiCtx) { c.code = code; c.hasCode = true }
-}
-
-func (c *apiCtx) attrs(status Status) []attribute.KeyValue {
-	cfgMu.RLock()
-	out := make([]attribute.KeyValue, 0, len(standardLabels)+4)
-	out = append(out, standardLabels...)
-	cfgMu.RUnlock()
-	out = append(out, attribute.String("status", string(status)))
-	if c.route != "" {
-		out = append(out, attribute.String("route", c.route))
-	}
-	if c.method != "" {
-		out = append(out, attribute.String("method", c.method))
-	}
-	if c.hasCode {
-		out = append(out, attribute.String("code", strconv.Itoa(c.code)))
-	}
-	return out
-}
-
-func ensureAPIInstruments() error {
+func ensureStandard() error {
 	instMu.Lock()
 	defer instMu.Unlock()
-	if apiCounter != nil && apiHistogram != nil {
+	if apiHistogram != nil {
 		return nil
 	}
 	meter := otel.Meter(meterScope)
-	c, err := meter.Int64Counter(standardCounterName)
-	if err != nil {
-		return fmt.Errorf("metrics: api_counter: %w", err)
+	var err error
+	if apiHistogram, err = meter.Float64Histogram(apiHistogramName, metric.WithUnit("s"),
+		metric.WithDescription("Inbound API requests: latency in seconds, labelled by api, http_status and status.")); err != nil {
+		return fmt.Errorf("metrics: %s: %w", apiHistogramName, err)
 	}
-	h, err := meter.Float64Histogram(standardHistogramName, metric.WithUnit("s"))
-	if err != nil {
-		return fmt.Errorf("metrics: api_histogram: %w", err)
+	if depHistogram, err = meter.Float64Histogram(dependencyHistogramName, metric.WithUnit("s"),
+		metric.WithDescription("Outbound dependency calls: latency in seconds, labelled by dependency, operation and status.")); err != nil {
+		return fmt.Errorf("metrics: %s: %w", dependencyHistogramName, err)
 	}
-	apiCounter = c
-	apiHistogram = h
+	if jobHistogram, err = meter.Float64Histogram(jobHistogramName, metric.WithUnit("s"),
+		metric.WithDescription("Worker job runs: latency in seconds, labelled by job and status.")); err != nil {
+		return fmt.Errorf("metrics: %s: %w", jobHistogramName, err)
+	}
 	return nil
 }
 
-// IncAPI increments the standard api_counter with status + opts. Errors
-// during instrument creation are silently swallowed (metrics emission is
-// best-effort) but the function returns early so it never panics.
-func IncAPI(status Status, opts ...APIOption) {
-	if !status.Valid() {
-		status = StatusFailure
-	}
-	if err := ensureAPIInstruments(); err != nil {
-		return
-	}
-	c := &apiCtx{}
-	for _, o := range opts {
-		o(c)
-	}
-	apiCounter.Add(context.Background(), 1, metric.WithAttributes(c.attrs(status)...))
+func withStandard(extra ...attribute.KeyValue) metric.MeasurementOption {
+	cfgMu.RLock()
+	out := make([]attribute.KeyValue, 0, len(standardLabels)+len(extra))
+	out = append(out, standardLabels...)
+	cfgMu.RUnlock()
+	out = append(out, extra...)
+	return metric.WithAttributes(out...)
 }
 
-// RecordAPILatency records d on the standard api_histogram (unit=seconds).
-func RecordAPILatency(d time.Duration, status Status, opts ...APIOption) {
-	if !status.Valid() {
-		status = StatusFailure
+func validStatus(s Status) Status {
+	if !s.Valid() {
+		return StatusFailure
 	}
-	if err := ensureAPIInstruments(); err != nil {
+	return s
+}
+
+// RecordAPI records one inbound request on api_histogram.
+//
+// api is the route's stable name (the OpenAPI operationId, or
+// "<method>_<pattern>" for hand-registered routes), never a raw URL
+// path: label values must be bounded.
+func RecordAPI(api string, httpStatus int, status Status, d time.Duration) {
+	if ensureStandard() != nil {
 		return
 	}
-	c := &apiCtx{}
-	for _, o := range opts {
-		o(c)
+	apiHistogram.Record(context.Background(), d.Seconds(), withStandard(
+		attribute.String("api", api),
+		attribute.String("http_status", strconv.Itoa(httpStatus)),
+		attribute.String("status", string(validStatus(status))),
+	))
+}
+
+// RecordDependency records one outbound call on dependency_histogram.
+// dependency ("postgres", "spotify") and operation ("ListTasks",
+// "GET") must be constants, never request data.
+func RecordDependency(dependency, operation string, status Status, d time.Duration) {
+	if ensureStandard() != nil {
+		return
 	}
-	apiHistogram.Record(context.Background(), d.Seconds(), metric.WithAttributes(c.attrs(status)...))
+	depHistogram.Record(context.Background(), d.Seconds(), withStandard(
+		attribute.String("dependency", dependency),
+		attribute.String("operation", operation),
+		attribute.String("status", string(validStatus(status))),
+	))
+}
+
+// RecordJob records one worker job run on job_histogram.
+func RecordJob(job string, status Status, d time.Duration) {
+	if ensureStandard() != nil {
+		return
+	}
+	jobHistogram.Record(context.Background(), d.Seconds(), withStandard(
+		attribute.String("job", job),
+		attribute.String("status", string(validStatus(status))),
+	))
 }
 
 // IncCounter increments an adhoc counter named name. Returns an error if
@@ -344,8 +342,10 @@ func validateAdhocName(name string) error {
 	if name == "" {
 		return errors.New("metrics: name is required")
 	}
-	if strings.HasPrefix(name, "api_") {
-		return ErrReservedName
+	for _, p := range []string{"api_", "dependency_", "job_"} {
+		if strings.HasPrefix(name, p) {
+			return ErrReservedName
+		}
 	}
 	return nil
 }
@@ -396,8 +396,9 @@ func resetForTest() {
 	standardLabels = nil
 	cfgMu.Unlock()
 	instMu.Lock()
-	apiCounter = nil
 	apiHistogram = nil
+	depHistogram = nil
+	jobHistogram = nil
 	adhocCounters = map[string]metric.Int64Counter{}
 	adhocHistos = map[string]metric.Float64Histogram{}
 	instMu.Unlock()

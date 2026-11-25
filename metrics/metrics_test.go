@@ -100,37 +100,12 @@ func TestStatus_Valid(t *testing.T) {
 	}
 }
 
-func TestIncAPI_EmitsAPICounterWithStandardLabels(t *testing.T) {
+func TestRecordAPI_EmitsHistogramWithStandardLabels(t *testing.T) {
 	r, cleanup := installReader(t)
 	defer cleanup()
 	mustConfigure(t, nil)
 
-	IncAPI(StatusSuccess, WithRoute("/v1/x"), WithMethod("GET"), WithCode(200))
-
-	m, ok := collectByName(t, r, "api_counter")
-	if !ok {
-		t.Fatal("api_counter not emitted")
-	}
-	a := sumAttrs(m)
-	if a["service"] != "svc" || a["env"] != "test" || a["status"] != "success" {
-		t.Errorf("missing standard labels: %v", a)
-	}
-	if a["route"] != "/v1/x" || a["method"] != "GET" || a["code"] != "200" {
-		t.Errorf("missing option labels: %v", a)
-	}
-	for _, k := range []string{"pod", "namespace", "host", "ip", "cluster", "region"} {
-		if _, present := a[k]; !present {
-			t.Errorf("standard label %q missing (value may be empty, but key must be present)", k)
-		}
-	}
-}
-
-func TestRecordAPILatency_EmitsHistogramSeconds(t *testing.T) {
-	r, cleanup := installReader(t)
-	defer cleanup()
-	mustConfigure(t, nil)
-
-	RecordAPILatency(150*time.Millisecond, StatusError, WithRoute("/q"), WithMethod("POST"), WithCode(404))
+	RecordAPI("getTask", 404, StatusError, 150*time.Millisecond)
 
 	m, ok := collectByName(t, r, "api_histogram")
 	if !ok {
@@ -140,24 +115,37 @@ func TestRecordAPILatency_EmitsHistogramSeconds(t *testing.T) {
 		t.Errorf("expected unit=s, got %q", m.Unit)
 	}
 	a := histAttrs(m)
-	if a["status"] != "error" || a["route"] != "/q" || a["method"] != "POST" || a["code"] != "404" {
+	if a["service"] != "svc" || a["env"] != "test" || a["status"] != "error" || a["api"] != "getTask" || a["http_status"] != "404" {
 		t.Errorf("attrs: %v", a)
+	}
+	for _, k := range []string{"pod", "namespace", "host", "ip", "cluster", "region"} {
+		if _, present := a[k]; !present {
+			t.Errorf("standard label %q missing (value may be empty, but key must be present)", k)
+		}
 	}
 }
 
-func TestIncAPI_InvalidStatusFallsBackToFailure(t *testing.T) {
+func TestRecordDependencyAndJob(t *testing.T) {
 	r, cleanup := installReader(t)
 	defer cleanup()
 	mustConfigure(t, nil)
 
-	IncAPI(Status("garbage"))
+	RecordDependency("postgres", "GetTask", StatusCanceled, time.Millisecond)
+	RecordJob("process-tasks", Status("garbage"), time.Millisecond)
 
-	m, ok := collectByName(t, r, "api_counter")
+	m, ok := collectByName(t, r, "dependency_histogram")
 	if !ok {
-		t.Fatal("api_counter missing")
+		t.Fatal("dependency_histogram missing")
 	}
-	if sumAttrs(m)["status"] != "failure" {
-		t.Errorf("expected fallback failure, got %v", sumAttrs(m))
+	if a := histAttrs(m); a["dependency"] != "postgres" || a["operation"] != "GetTask" || a["status"] != "canceled" {
+		t.Errorf("attrs: %v", a)
+	}
+	m, ok = collectByName(t, r, "job_histogram")
+	if !ok {
+		t.Fatal("job_histogram missing")
+	}
+	if a := histAttrs(m); a["job"] != "process-tasks" || a["status"] != "failure" {
+		t.Errorf("invalid status should fall back to failure: %v", a)
 	}
 }
 

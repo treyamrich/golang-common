@@ -1,130 +1,195 @@
 # golang-common
 
-Shared Go libraries for services consuming this module. Ships an
-OpenTelemetry metrics baseline (HTTP server middleware, HTTP client
-wrapper), an OTEL init helper, a small standard-and-adhoc metrics API,
-uniform health endpoints, and the app-broker client SDK. Tracing is
-intentionally deferred to a later release.
+Shared Go libraries that make every homelab service look the same from
+the outside:
+- the same bootstrap and shutdown;
+- the same HTTP middleware and error bodies;
+- the same auth;
+- the same metrics and logs.
+
+A service built on it differs only in its core logic, dependencies and
+routes. [go-service-template](https://github.com/treyamrich/go-service-template)
+is the reference service; start new services from it.
 
 ## Install
 
 ```sh
-go get github.com/treyamrich/golang-common/otelinit@v0.3.0
-go get github.com/treyamrich/golang-common/otelhttp@v0.3.0
-go get github.com/treyamrich/golang-common/metrics@v0.3.0
-go get github.com/treyamrich/golang-common/health@v0.3.0
-go get github.com/treyamrich/golang-common/log@v0.3.0
-go get github.com/treyamrich/golang-common/appbroker@v0.4.0
+go get github.com/treyamrich/golang-common@v0.5.0
 ```
+
+All packages share the module version.
 
 ## Packages
 
-### `otelinit` — one-shot OTEL SDK setup
+| Package | What it gives a service |
+|---|---|
+| `app` | `app.Run(name, setup)`: config, logging and metrics init, admin server (`/healthz` `/readyz` `/metrics`), dependency start/close, runners, job loops, graceful shutdown |
+| `config` | `config.Load[T]()`: env vars into a struct (`env:` tags, defaults, `required`, `file`) |
+| `api` | HTTP server + standard middleware chain: correlation ID, `api_histogram` + access log, client-disconnect → 499, panic recovery, timeout, body limit; error handlers for oapi-codegen's strict server |
+| `auth` | Bearer JWT verification against OIDC issuers (Authentik), `Principal` on the context, `auth.OpenAPI` (per-operation, enforces the spec's `security`), `auth.Middleware`, `auth.RequireScopes` |
+| `auth/authtest` | A fake issuer that mints tokens, for handler tests |
+| `apperr` | Error kinds shared by core and adapters → HTTP status, metrics status, standard error body |
+| `observe` | `observe.Call` / `observe.Do`: wrap any dependency call → `dependency_histogram` |
+| `postgres` | pgx pool as an `app` dependency (Start pings with retry, Check for readiness, Close) |
+| `otelhttp` | `NewClient`: outbound HTTP with cxid forwarding + `dependency_histogram` |
+| `otelinit` | MeterProvider setup: Prometheus (default) or OTLP |
+| `metrics` | The three standard histograms + adhoc metrics |
+| `log` | JSON slog, cxid on every `*Context` log call |
+| `health` | `/healthz` and `/readyz` handlers (used by `app`) |
+| `appbroker` | app-broker client SDK |
+
+### `app` — process bootstrap
 
 ```go
-shutdown, err := otelinit.Init(ctx, otelinit.Config{
-    ServiceName:    "app-broker",
-    ServiceVersion: version,
-    Environment:    "prod",          // required
-    Cluster:        "prod-us-east",  // optional
-    Region:         "us-east-1",     // optional
-    OTLPEndpoint:   os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
-    Insecure:       true,
+type Config struct {
+    API  api.Config      // HTTP_ADDR, HTTP_REQUEST_TIMEOUT, ...
+    DB   postgres.Config // DB_HOST, DB_USER, ...
+    Auth auth.OIDCConfig // AUTH_ISSUERS, AUTH_AUDIENCES
+}
+
+func main() {
+    app.Run("tasks-api", func(ctx context.Context, a *app.App, cfg Config) error {
+        db, err := postgres.New(cfg.DB)
+        if err != nil {
+            return err
+        }
+        if err := a.Start(ctx, "postgres", db); err != nil { // pinged now, closed last
+            return err
+        }
+        verifier, err := auth.NewOIDC(cfg.Auth)
+        if err != nil {
+            return err
+        }
+        svc := core.NewService(pgstore.NewStore(db.Pool))
+        a.Add(api.New("api", cfg.API, httpin.NewHandler(svc, verifier)))
+        return nil
+    })
+}
+```
+
+A worker is the same without routes:
+
+```go
+a.Every("complete-pending", 10*time.Second, job) // fresh cxid + job_histogram per run, panics survive
+a.Once("nightly-sync", job)                      // CronJob: process exits when done, 1 on error
+a.Go("consumer", func(ctx context.Context) error { ... }) // anything long-running
+```
+
+Lifecycle:
+
+1. Load the base config (`APP_ENV`, `ADMIN_ADDR`, `SHUTDOWN_*`) and the service's config. An error exits 1.
+2. Init logs and metrics.
+3. Start the admin server on `:8081`. `/readyz` returns 503 until setup returns, then runs each started dependency's `Check`.
+4. Run setup.
+5. Run the runners until SIGTERM, a runner error, or all runners have finished.
+6. On shutdown:
+   - `/readyz` → 503;
+   - sleep `SHUTDOWN_DELAY` (5s);
+   - cancel the runners and wait for them;
+   - close dependencies in reverse order;
+   - flush metrics.
+
+   It is bounded by `SHUTDOWN_TIMEOUT` (25s).
+
+### `api` — inbound HTTP
+
+`api.New(name, cfg, handler)` serves `handler` behind this chain, outermost first:
+
+1. **CorrelationID.**
+2. **Observe:** `api_histogram` plus one access-log line. A request whose client went away is recorded as **499 / `canceled`**, never a 5xx.
+3. **Recover.**
+4. **Timeout.**
+5. **LimitBody.**
+
+The `api` label is the router's matched pattern, e.g. `get_/v1/tasks/{id}`. It is bounded by construction, and set for every response, including auth rejections. Unrouted requests are `unmatched`. Use `api.Route(name, h)` to override it.
+
+With oapi-codegen (`std-http-server` + `strict-server`):
+
+```go
+strict := openapi.NewStrictHandlerWithOptions(srv, nil, openapi.StrictHTTPServerOptions{
+    RequestErrorHandlerFunc:  api.RequestError,  // unparsable request → 400
+    ResponseErrorHandlerFunc: api.ResponseError, // returned error → its apperr status + body
 })
-if err != nil {
-    log.Fatal(err)
-}
-defer shutdown(context.Background())
+h := openapi.HandlerWithOptions(strict, openapi.StdHTTPServerOptions{
+    BaseRouter:       http.NewServeMux(),
+    Middlewares:      []openapi.MiddlewareFunc{auth.OpenAPI(verifier, openapi.OidcScopes)},
+    ErrorHandlerFunc: api.RequestError,
+})
 ```
 
-`Init` wires the global `MeterProvider` with an OTLP gRPC exporter, the
-W3C `tracecontext` + `baggage` propagators, and configures the standard
-metric label set (see below). Returned `shutdown` flushes pending metrics
-with a 5s timeout — defer it in `main`.
+### `auth` — authentication and scopes
 
-### `otelhttp` — HTTP server middleware + client wrapper
+- **`auth.NewOIDC(cfg)`** verifies tokens:
+  - RS256, from a configured issuer, checked against its JWKS;
+  - unexpired;
+  - an accepted audience.
+
+  Discovery is lazy, so an IdP outage at startup doesn't keep the service down; affected requests get 503. Keys refresh hourly and on an unknown `kid`. Scopes come from `scope` (Authentik) or `scp`.
+- **`auth.OpenAPI(v, openapi.OidcScopes)`** enforces each operation's `security` from the spec:
+  - required: authenticate, then require the listed scopes;
+  - `security: []`: public.
+- **`auth.Middleware(v, scopes...)`** protects a whole handler.
+- **`auth.RequireScopes(ctx, ...)`** returns `apperr` Unauthenticated or Forbidden.
+- **`auth.FromContext(ctx)`** returns the `Principal`.
+- **Responses:** 401 (with `WWW-Authenticate`) or 403 in the standard error body. The specific reason is logged, never returned.
+
+### `apperr` — error kinds
+
+| Kind | HTTP | metrics status |
+|---|---|---|
+| `Invalid` | 400 | error |
+| `Unauthenticated` | 401 | error |
+| `Forbidden` | 403 | error |
+| `NotFound` | 404 | error |
+| `Conflict` | 409 | error |
+| `Unavailable` | 503 | failure |
+| any other error | 500 (generic message) | failure |
+| unclassified `context.Canceled` | 499 | canceled |
+| unclassified `context.DeadlineExceeded` | 504 | failure |
+
+`apperr.WriteHTTP` writes `{"error":{"code","message","correlation_id"}}`.
+
+### `observe` — dependency metrics
 
 ```go
-mux := http.NewServeMux()
-mux.HandleFunc("/v1/credential/oauth-user", handleOAuthUser)
-
-server := &http.Server{
-    Addr:    ":8080",
-    Handler: otelhttp.Server(mux, otelhttp.WithServiceName("app-broker")),
-}
+task, err := observe.Call(ctx, "postgres", "GetTask", func(ctx context.Context) (core.Task, error) {
+    return s.get(ctx, id)
+})
+err := observe.Do(ctx, "redis", "Set", func(ctx context.Context) error { ... })
 ```
+
+Each call records one `dependency_histogram{dependency, operation, status}` sample.
+- **Default status:** `apperr.Status`. Our own cancelled context is `canceled`; a dependency that returns "canceled" by itself is `failure`.
+- **Override** with a classifier: `func(res T, err error) metrics.Status`.
+- **Panics** are recorded as `failure` and re-panicked.
+- **Labels** must be constants.
+
+### `otelinit` and `metrics`
+
+`app` calls `otelinit.Init`. The default exporter is Prometheus, served by `otelinit.Handler()` at the admin `/metrics`. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` switches to OTLP push.
+
+Standard metrics:
+
+| Name | Labels (+ standard set) | Recorded by |
+|---|---|---|
+| `api_histogram` | `api`, `http_status`, `status` | `api` |
+| `dependency_histogram` | `dependency`, `operation`, `status` | `observe`, `otelhttp.NewClient` |
+| `job_histogram` | `job`, `status` | `app.Every` / `Once` / `RunJob` |
+
+- **Units and counts.** All three are in seconds, and each `_count` is the call counter.
+- **The standard set:** `service`, `env`, `pod`, `namespace`, `host`, `ip`, `cluster`, `region`. Scrape with `honorLabels: true` so it isn't renamed to `exported_*`.
+- **`status` values:** `success`, `error`, `failure`, `canceled`.
+- **Adhoc metrics:** `metrics.IncCounter` / `RecordHistogram`. The prefixes `api_`, `dependency_` and `job_` are reserved.
+
+### `otelhttp` — outbound HTTP
 
 ```go
-client := otelhttp.NewClient(otelhttp.WithTimeout(15 * time.Second))
-resp, err := client.Get("https://api.example.com/v1/me")
+client := otelhttp.NewClient(otelhttp.WithDependency("spotify")) // 10s default timeout
 ```
 
-`Server` and `NewClient` emit the standard `api_counter` and
-`api_histogram` metrics on every non-excluded request (see "Standard
-metrics" below). The upstream
-`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` is still
-chained for trace context, but its semconv metrics are no longer the
-primary signal.
-
-#### Default exclusions
-
-`Server` excludes `/healthz`, `/readyz`, and `/metrics` by default — these
-paths do not appear in `api_counter` / `api_histogram`. Override via
-`otelhttp.WithExcludedPaths(...)`.
-
-### `metrics` — standard + adhoc metrics
-
-Two tiers:
-
-```go
-// Standard tier — fixed names + label keys, caller fills option-driven values.
-metrics.IncAPI(metrics.StatusSuccess,
-    metrics.WithRoute("/v1/credential/oauth-user"),
-    metrics.WithMethod("GET"),
-    metrics.WithCode(200))
-
-metrics.RecordAPILatency(elapsed, metrics.StatusFailure,
-    metrics.WithRoute("/v1/charge"),
-    metrics.WithMethod("POST"),
-    metrics.WithCode(502))
-
-// Adhoc tier — caller picks the name. Use sparingly.
-_ = metrics.IncCounter("widget_processed", map[string]string{"kind": "premium"})
-_ = metrics.RecordHistogram("widget_size_bytes", 4096, map[string]string{"kind": "premium"})
-```
-
-#### Status enum
-
-| Constant            | Meaning                                                  |
-|---------------------|----------------------------------------------------------|
-| `StatusSuccess`     | Happy path (2xx, intended outcome).                      |
-| `StatusError`       | Expected failure — 4xx, validation, consent revoked.     |
-| `StatusFailure`     | Unexpected failure — 5xx, panic, dependency down.        |
-
-#### Standard label set
-
-Auto-attached to every standard AND adhoc metric:
-
-| Label       | Source                                                |
-|-------------|-------------------------------------------------------|
-| `service`   | `Init.Config.ServiceName` (required)                  |
-| `env`       | `Init.Config.Environment` (required)                  |
-| `pod`       | env `HOSTNAME` or local hostname                      |
-| `namespace` | env `POD_NAMESPACE` (k8s downward API)                |
-| `host`      | env `NODE_NAME` or `EC2_INSTANCE_ID` or hostname      |
-| `ip`        | env `POD_IP` or first non-loopback interface          |
-| `cluster`   | `Init.Config.Cluster` or env `CLUSTER_NAME`           |
-| `region`    | `Init.Config.Region` or env `REGION`                  |
-
-Anything in `Init.Config.StaticLabels` overrides the auto-detected entry
-of the same key. Inspect the active label set in tests via
-`metrics.StandardLabels()`.
-
-#### Adhoc names
-
-Names starting with `api_` are reserved for the standard tier — adhoc
-emitters return `metrics.ErrReservedName` if used. This keeps the
-`api_*` namespace clean for cross-service dashboards.
+- **Correlation ID:** forwards the context's cxid as `X-Correlation-Id`.
+- **Metrics:** records `dependency_histogram{dependency, operation=<method>}`.
+- **Status:** a dependency's 5xx or 429 is `failure`, another 4xx is `error`, and our own cancellation is `canceled`.
 
 ### `log` — structured logging + correlation IDs
 
@@ -151,9 +216,9 @@ timestamps. It is idempotent — second and later calls return
 `LOG_LEVEL` values are coerced to `info` with a one-time warning rather
 than panicking.
 
-`log.New(ctx)` returns a `*slog.Logger` pre-bound with the cxid (if any)
-from `ctx`. All request-scope logging should go through it instead of
-`slog.Default()` so cxid auto-propagates to every line.
+Every `slog.*Context(ctx, ...)` call carries the context's cxid (the
+handler `Init` installs reads it). `log.New(ctx)` returns a logger
+pre-bound with it, for code that logs without a context.
 
 ### Correlation IDs
 
@@ -161,13 +226,13 @@ A correlation ID (`cxid`) is a 32-hex-char UUIDv4 (no hyphens) that ties a
 single request's logs together across services. The flow is fully
 automatic when both ends use this library:
 
-1. **Inbound:** `otelhttp.Server` reads the `X-Correlation-Id` header. If
+1. **Inbound:** the `api` package reads the `X-Correlation-Id` header. If
    it matches `^[a-f0-9]{32}$` it's reused; otherwise a fresh one is
    generated. The cxid is injected into `r.Context()` via `log.WithCxid`
    and echoed back on the response as `X-Correlation-Id` (so the caller
    can grep their own logs).
-2. **In-process:** any handler that calls `log.New(r.Context())` emits
-   logs with the `cxid` attribute attached automatically.
+2. **In-process:** every `slog.*Context(ctx, ...)` line carries it.
+   Worker job runs (`app.Every` / `RunJob`) mint one per run.
 3. **Outbound:** `otelhttp.NewClient` reads `log.FromContext(req.Context())`
    on every outbound call and sets `X-Correlation-Id` on the wire (only
    if the caller didn't already set the header). The next service's
@@ -240,16 +305,8 @@ mux.Handle("/readyz", health.ReadinessHandler(serviceName, version, commit,
 `/readyz` runs every check on each request. All passing → 200 +
 `status:"ok"`. Any failing → 503 + `status:"unhealthy"` + `reasons` array.
 
-Each `Check.Timeout` defaults to 2s when zero. Both endpoints are
-already in `otelhttp.Server`'s default-excluded-paths, so they are not
-counted in the API metrics.
-
-## Standard metrics emitted
-
-| Name            | Kind          | Labels                                               | Source                            |
-|-----------------|---------------|------------------------------------------------------|-----------------------------------|
-| `api_counter`   | Counter       | `status`, `route`, `method`, `code` + standard set   | `otelhttp.Server` / `NewClient`   |
-| `api_histogram` | Histogram (s) | `status`, `route`, `method`, `code` + standard set   | `otelhttp.Server` / `NewClient`   |
+Each `Check.Timeout` defaults to 2s when zero. `app` serves both on the
+admin port, so they never reach the API metrics.
 
 ## What's NOT in the library
 
@@ -279,6 +336,18 @@ under this module shares the module-wide tag.
 
 **Pre-1.0.** Breaking changes possible at minor bumps. v1.0.0 is tagged
 once the API is stable across at least three consumers.
+
+## Upgrading from v0.4.0
+
+v0.5.0 breaks the HTTP and metrics APIs:
+
+- **`otelhttp.Server` is gone.** Serve through `api.New` / `api.Chain`, or better, `app.Run`.
+- **Metric changes:**
+  - `metrics.IncAPI`, `RecordAPILatency` and `With*` are replaced by `RecordAPI`, `RecordDependency` and `RecordJob`;
+  - `api_counter` is gone: use `api_histogram_count`;
+  - `api_histogram`'s labels are now `api`, `http_status` and `status`.
+- **Outbound calls** record `dependency_histogram`, not `api_*`.
+- **The default exporter is now Prometheus.** It is OTLP only when an endpoint is set.
 
 ## Upgrading from v0.2.0
 
