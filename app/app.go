@@ -217,6 +217,9 @@ func (a *App) runAll(sigctx context.Context) int {
 		err  error
 	}
 	results := make(chan result, len(runners))
+	// Ready once setup has finished and the runners are launching; a
+	// readiness probe's period dwarfs the time a server takes to listen.
+	a.ready.Store(true)
 	for _, r := range runners {
 		go func() {
 			defer func() {
@@ -227,7 +230,6 @@ func (a *App) runAll(sigctx context.Context) int {
 			results <- result{r.Name(), r.Run(runCtx)}
 		}()
 	}
-	a.ready.Store(true)
 	slog.Info("ready", "runners", len(runners))
 
 	code, pending := 0, len(runners)
