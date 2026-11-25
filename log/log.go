@@ -56,6 +56,11 @@ type Config struct {
 	Output io.Writer
 }
 
+// CorrelationIDHeader is the HTTP header that carries the cxid between
+// services. The api package reads it (or mints one) on every inbound
+// request; otelhttp clients forward it.
+const CorrelationIDHeader = "X-Correlation-Id"
+
 type cxidKeyType struct{}
 
 // CxidKey is the context key for the correlation ID. Most callers should
@@ -104,7 +109,7 @@ func Init(cfg Config) error {
 	}
 	staticOnce.Unlock()
 
-	logger := slog.New(handler)
+	logger := slog.New(NewContextHandler(handler))
 	if len(cfg.StaticAttrs) > 0 {
 		logger = logger.With(staticAttrSlice(cfg.StaticAttrs)...)
 	}
@@ -220,6 +225,49 @@ func IsValidCxid(s string) bool {
 		}
 	}
 	return true
+}
+
+// ContextHandler wraps a slog.Handler so every record logged with a
+// context (slog.InfoContext(ctx, ...), logger.ErrorContext(ctx, ...))
+// carries that context's cxid, without callers having to use New(ctx).
+// Init installs it; wrap your own handler with NewContextHandler if you
+// build loggers yourself.
+type ContextHandler struct {
+	inner slog.Handler
+	// bound is set once a cxid attr was attached with WithAttrs (New(ctx)
+	// does this), so the cxid isn't written twice.
+	bound bool
+}
+
+// NewContextHandler returns a ContextHandler around h.
+func NewContextHandler(h slog.Handler) *ContextHandler { return &ContextHandler{inner: h} }
+
+func (h *ContextHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.inner.Enabled(ctx, l)
+}
+
+func (h *ContextHandler) Handle(ctx context.Context, r slog.Record) error {
+	if !h.bound {
+		if cxid := FromContext(ctx); cxid != "" {
+			r = r.Clone()
+			r.AddAttrs(slog.String("cxid", cxid))
+		}
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h *ContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	bound := h.bound
+	for _, a := range attrs {
+		if a.Key == "cxid" {
+			bound = true
+		}
+	}
+	return &ContextHandler{inner: h.inner.WithAttrs(attrs), bound: bound}
+}
+
+func (h *ContextHandler) WithGroup(name string) slog.Handler {
+	return &ContextHandler{inner: h.inner.WithGroup(name), bound: h.bound}
 }
 
 // resetForTest clears Init state. Test-only.

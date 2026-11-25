@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.5.0 — 2026-11-25
+
+A service framework: every service gets the same bootstrap, HTTP chain,
+auth, errors, metrics and logs. Reference service:
+github.com/treyamrich/go-service-template.
+
+### Added
+- `app`: `Run` bootstrap with config, logging/metrics init, admin server
+  (`/healthz`, `/readyz` from started dependencies, `/metrics`), ordered
+  dependency start/close, runners, `Every`/`Once`/`RunJob` job loops
+  (cxid per run, `job_histogram`, panic recovery) and graceful shutdown.
+- `config`: `Load[T]` from env vars (caarlos0/env).
+- `api`: HTTP server and standard chain: correlation ID, `api_histogram`
+  + access log with route-pattern labels, client disconnect recorded as
+  499/canceled, panic recovery, request timeout, body limit; strict-server
+  error handlers.
+- `auth`: OIDC JWT verification (moved and generalised from app-broker),
+  `Principal`, `OpenAPI` per-operation middleware enforcing the spec's
+  security/scopes, `Middleware`, `RequireScopes`; `auth/authtest` fake
+  issuer.
+- `apperr`: error kinds → HTTP status, metrics status, standard body.
+- `observe`: `Call`/`Do` dependency wrapper → `dependency_histogram`.
+- `postgres`: pgx pool as an `app` dependency.
+- `metrics`: `dependency_histogram`, `job_histogram`, `StatusCanceled`.
+- `otelinit`: Prometheus exporter (default) and `Handler()`.
+- `log`: `ContextHandler`, so `slog.*Context` lines carry the cxid;
+  `CorrelationIDHeader`.
+
+### Changed (breaking)
+- `api_histogram` labels are `api`, `http_status`, `status`; `api_counter`
+  removed (use `_count`).
+- `otelhttp.NewClient` records `dependency_histogram`
+  (`WithDependency`), not `api_*`.
+- Removed `otelhttp.Server`, `metrics.IncAPI`, `RecordAPILatency`,
+  `WithRoute`/`WithMethod`/`WithCode`.
+
 ## v0.4.0 — 2026-11-24
 
 ### Added

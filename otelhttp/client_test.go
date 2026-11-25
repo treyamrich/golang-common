@@ -2,79 +2,82 @@ package otelhttp
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"github.com/treyamrich/golang-common/internal/metrictest"
+	"github.com/treyamrich/golang-common/log"
 )
 
 func TestNewClient_DefaultTimeout(t *testing.T) {
-	c := NewClient()
-	if c.Timeout != DefaultClientTimeout {
-		t.Errorf("expected default timeout %v, got %v", DefaultClientTimeout, c.Timeout)
+	if c := NewClient(); c.Timeout != DefaultClientTimeout {
+		t.Fatalf("timeout=%v", c.Timeout)
 	}
-	if c.Transport == nil {
-		t.Fatal("transport should be set")
-	}
-}
-
-func TestNewClient_WithTimeout(t *testing.T) {
-	c := NewClient(WithTimeout(2 * time.Second))
-	if c.Timeout != 2*time.Second {
-		t.Errorf("expected 2s timeout, got %v", c.Timeout)
+	if c := NewClient(WithTimeout(time.Second)); c.Timeout != time.Second {
+		t.Fatalf("timeout=%v", c.Timeout)
 	}
 }
 
-func TestNewClient_WithBaseTransport(t *testing.T) {
-	custom := &http.Transport{}
-	c := NewClient(WithBaseTransport(custom))
-	if c.Transport == nil {
-		t.Fatal("transport should be set")
-	}
-}
-
-func TestNewClient_RecordsMetrics(t *testing.T) {
-	reader, cleanup := installManualReader(t)
-	defer cleanup()
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	}))
+func TestNewClient_RecordsDependencyMetrics(t *testing.T) {
+	r := metrictest.Install(t)
+	code := 200
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
 	defer srv.Close()
+	c := NewClient(WithDependency("spotify"))
 
-	client := NewClient()
-	resp, err := client.Get(srv.URL + "/test")
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	for _, code = range []int{200, 404, 503, 429} {
+		resp, err := c.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if _, err := c.Do(req); err == nil {
+		t.Fatal("want error")
 	}
 
-	found := false
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name == "api_histogram" {
-				found = true
-			}
+	got := r.Counts(t, "dependency_histogram", "status")
+	for k, v := range map[string]uint64{"success": 1, "error": 1, "failure": 2, "canceled": 1} {
+		if got[k] != v {
+			t.Errorf("%s: got %d want %d (%v)", k, got[k], v, got)
 		}
 	}
-	if !found {
-		t.Errorf("expected api_histogram to be recorded")
+	if deps := r.Counts(t, "dependency_histogram", "dependency"); deps["spotify"] != 5 {
+		t.Errorf("dependency label: %v", deps)
+	}
+	if ops := r.Counts(t, "dependency_histogram", "operation"); ops["GET"] != 5 {
+		t.Errorf("operation label: %v", ops)
 	}
 }
 
-func TestNewClient_WithUpstreamOptions(t *testing.T) {
-	c := NewClient(WithClientUpstreamOptions())
-	if c.Transport == nil {
-		t.Fatal("transport should be set")
+func TestClient_ForwardsCxid(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get(CorrelationIDHeader))
+	}))
+	defer srv.Close()
+	c := NewClient()
+	cxid := log.NewCxid()
+
+	req, _ := http.NewRequestWithContext(log.WithCxid(context.Background(), cxid), http.MethodGet, srv.URL, nil)
+	resp, _ := c.Do(req)
+	resp.Body.Close()
+
+	req, _ = http.NewRequestWithContext(log.WithCxid(context.Background(), cxid), http.MethodGet, srv.URL, nil)
+	req.Header.Set(CorrelationIDHeader, "explicit")
+	resp, _ = c.Do(req)
+	resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodGet, srv.URL, nil)
+	resp, _ = c.Do(req)
+	resp.Body.Close()
+
+	if got[0] != cxid || got[1] != "explicit" || got[2] != "" {
+		t.Fatalf("got %q", got)
 	}
 }
